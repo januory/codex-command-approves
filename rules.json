@@ -1,0 +1,16 @@
+{
+  "rules": [
+    {
+      "pattern": "git status",
+      "action": "allow"
+    },
+    {
+      "pattern": "git push",
+      "action": "deny"
+    },
+    {
+      "pattern": "git",
+      "action": "ask"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "codex-command-approves",
+  "version": "1.0.0",
+  "description": "Codex hook with ordered allow, ask, and deny command rules",
+  "type": "commonjs",
+  "main": "command-approves.js",
+  "files": [
+    "command-approves.js",
+    "rules.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/hook.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
