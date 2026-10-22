@@ -10,6 +10,37 @@ const MAX_INPUT_LENGTH = 1024 * 1024;
 const MAX_DEPTH = 8;
 const DEFAULT_ASK_DIALOG_TIMEOUT_MS = 8000;
 const DIALOG_TIMEOUT_ARG = '--dialog-timeout-ms=';
+const ASK_MUTEX_NAME = 'Local\\CodexCommandApproves.AskDialog.v1';
+const POWERSHELL_MUTEX_BOOTSTRAP = [
+  'Add-Type -AssemblyName System.Threading',
+  'function Exit-CodexAsk([int]$Code) {',
+  '  [Environment]::Exit($Code)',
+  '}',
+  '$mutexName = [Environment]::GetEnvironmentVariable("CODEX_ASK_MUTEX_NAME")',
+  'if ([string]::IsNullOrWhiteSpace($mutexName)) { Exit-CodexAsk 2 }',
+  'try {',
+  '  $mutex = [Threading.Mutex]::new($false, $mutexName)',
+  '  $ownsMutex = $false',
+  '  try {',
+  '    try {',
+  '      $ownsMutex = $mutex.WaitOne()',
+  '    } catch [Threading.AbandonedMutexException] {',
+  '      $ownsMutex = $true',
+  '    }',
+  '    if (-not $ownsMutex) { Exit-CodexAsk 3 }',
+  '    & {',
+].join('\n');
+const POWERSHELL_MUTEX_FINALLY = [
+  '    }',
+  '  } finally {',
+  '    if ($ownsMutex) { $mutex.ReleaseMutex() }',
+  '    $mutex.Dispose()',
+  '  }',
+  '} catch {',
+  '  [Console]::Error.WriteLine($_.Exception.Message)',
+  '  Exit-CodexAsk 4',
+  '}',
+].join('\n');
 const ASK_DIALOG_COPY = {
   en: {
     title: 'Codex command approval',
@@ -663,15 +694,40 @@ function renderAskDialogMessage(prompt, locale = 'en') {
   return typeof prompt === 'string' ? prompt : buildAskDialogMessage(prompt, locale);
 }
 
-function showAskDialog(prompt, timeoutMs = DEFAULT_ASK_DIALOG_TIMEOUT_MS) {
+function runPowerShellUnderAskMutex(
+  actionLines,
+  timeoutMs = DEFAULT_ASK_DIALOG_TIMEOUT_MS,
+  mutexName = ASK_MUTEX_NAME,
+) {
   if (process.platform !== 'win32') {
     throw new Error('Windows approval dialogs are not available on this platform');
   }
+  if (!Array.isArray(actionLines) || actionLines.some((line) => typeof line !== 'string')) {
+    throw new TypeError('PowerShell action must be an array of strings');
+  }
 
+  const script = [POWERSHELL_MUTEX_BOOTSTRAP, ...actionLines, POWERSHELL_MUTEX_FINALLY].join('\n');
+  const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
+  return spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-STA', '-EncodedCommand', encodedScript],
+    {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        CODEX_ASK_MUTEX_NAME: mutexName,
+      },
+    },
+  );
+}
+
+function showAskDialog(prompt, timeoutMs = DEFAULT_ASK_DIALOG_TIMEOUT_MS) {
   const locale = detectAskLocale();
   const message = renderAskDialogMessage(prompt, locale);
   const title = askDialogTitle(locale);
-  const script = [
+  const actionLines = [
     'Add-Type -AssemblyName System.Windows.Forms',
     '[System.Windows.Forms.Application]::EnableVisualStyles()',
     `$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(title).toString('base64')}'))`,
@@ -683,19 +739,10 @@ function showAskDialog(prompt, timeoutMs = DEFAULT_ASK_DIALOG_TIMEOUT_MS) {
     '  [System.Windows.Forms.MessageBoxIcon]::Question,',
     '  [System.Windows.Forms.MessageBoxDefaultButton]::Button2',
     ')',
-    'if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { exit 0 }',
-    'exit 1',
-  ].join('\n');
-  const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
-  const result = spawnSync(
-    'powershell.exe',
-    ['-NoLogo', '-NoProfile', '-STA', '-EncodedCommand', encodedScript],
-    {
-      encoding: 'utf8',
-      timeout: timeoutMs,
-      windowsHide: true,
-    },
-  );
+    'if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { Exit-CodexAsk 0 }',
+    'Exit-CodexAsk 1',
+  ];
+  const result = runPowerShellUnderAskMutex(actionLines, timeoutMs);
 
   if (result.error) throw result.error;
   if (result.status === 0) return true;
@@ -839,5 +886,6 @@ module.exports = {
   normalizeExpression,
   normalizeRules,
   renderAskDialogMessage,
+  runPowerShellUnderAskMutex,
   tokenizeScript,
 };

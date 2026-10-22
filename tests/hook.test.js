@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -61,6 +61,56 @@ function bash(command, eventName = 'PreToolUse') {
     tool_input: { command },
     tool_name: 'Bash',
   };
+}
+
+async function waitForFiles(files, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!files.every((file) => fs.existsSync(file))) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for test processes: ${files.join(', ')}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function waitForExit(child) {
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code, signal) => resolve({ code, signal, stderr }));
+  });
+}
+
+function powerShellLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function runAskMutexProbe(root, id, barrierPath, mutexName) {
+  const logPath = path.join(root, 'events.log');
+  const readyPath = path.join(root, `ready-${id}`);
+  const actionLines = [
+    `[IO.File]::AppendAllText(${powerShellLiteral(logPath)}, "start" + [Environment]::NewLine)`,
+    'Start-Sleep -Milliseconds 400',
+    `[IO.File]::AppendAllText(${powerShellLiteral(logPath)}, "finish" + [Environment]::NewLine)`,
+  ];
+  const source = `
+    const fs = require('node:fs');
+    const hookModule = require(${JSON.stringify(hook)});
+    fs.writeFileSync(${JSON.stringify(readyPath)}, '');
+    while (!fs.existsSync(${JSON.stringify(barrierPath)})) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+    const result = hookModule.runPowerShellUnderAskMutex(
+      ${JSON.stringify(actionLines)},
+      5000,
+      ${JSON.stringify(mutexName)},
+    );
+    if (result.error) throw result.error;
+    if (result.status !== 0 && result.status !== 1) process.exit(2);
+    process.exitCode = 0;
+  `;
+  return spawn(process.execPath, ['-e', source], { stdio: ['ignore', 'ignore', 'pipe'] });
 }
 
 test('PreToolUse denies a matching command', () => {
@@ -212,6 +262,69 @@ test('an approved ask rule allows the request in PermissionRequest', () => {
 
   assert.equal(output.hookSpecificOutput.hookEventName, 'PermissionRequest');
   assert.deepEqual(output.hookSpecificOutput.decision, { behavior: 'allow' });
+});
+
+test('concurrent ask dialogs run one at a time', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'command-approves-mutex-'));
+  const barrierPath = path.join(root, 'barrier');
+  const mutexName = `CodexCommandApprovesTest-${process.pid}-${Date.now()}`;
+  try {
+    const children = [
+      runAskMutexProbe(root, 1, barrierPath, mutexName),
+      runAskMutexProbe(root, 2, barrierPath, mutexName),
+    ];
+    await waitForFiles([path.join(root, 'ready-1'), path.join(root, 'ready-2')]);
+    fs.writeFileSync(barrierPath, '');
+
+    const results = await Promise.all(children.map(waitForExit));
+    if (results.some(({ code }) => code !== 0)) {
+      assert.fail(results.map(({ stderr }) => stderr).join('\n'));
+    }
+    assert.deepEqual(results.map(({ code }) => code), [0, 0]);
+    assert.deepEqual(
+      fs.readFileSync(path.join(root, 'events.log'), 'utf8').trim().split(/\r?\n/),
+      ['start', 'finish', 'start', 'finish'],
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a dialog process that times out does not block the next ask', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'command-approves-timeout-'));
+  const acquiredPath = path.join(root, 'acquired');
+  const mutexName = `CodexCommandApprovesTimeoutTest-${process.pid}-${Date.now()}`;
+  try {
+    const first = hookModule.runPowerShellUnderAskMutex([
+      `[IO.File]::WriteAllText(${powerShellLiteral(acquiredPath)}, '')`,
+      'Start-Sleep -Seconds 5',
+    ], 1500, mutexName);
+    assert.equal(first.error?.code, 'ETIMEDOUT');
+    assert.equal(fs.existsSync(acquiredPath), true);
+
+    const second = hookModule.runPowerShellUnderAskMutex(['$exitCode = 0'], 5000, mutexName);
+    assert.equal(second.error, undefined, second.stderr);
+    assert.equal(second.status, 0, second.stderr);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the next ask continues after a previous dialog exits without releasing its mutex', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const mutexName = `CodexCommandApprovesAbandonedTest-${process.pid}-${Date.now()}`;
+  const first = hookModule.runPowerShellUnderAskMutex(['Exit-CodexAsk 1'], 5000, mutexName);
+  assert.equal(first.error, undefined, first.stderr);
+  assert.equal(first.status, 1, first.stderr);
+
+  const second = hookModule.runPowerShellUnderAskMutex(['$exitCode = 0'], 5000, mutexName);
+  assert.equal(second.error, undefined, second.stderr);
+  assert.equal(second.status, 0, second.stderr);
 });
 
 test('an allow rule passes PreToolUse without overriding later safety layers', () => {
