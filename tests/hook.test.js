@@ -8,6 +8,25 @@ const path = require('node:path');
 const test = require('node:test');
 
 const hook = path.join(__dirname, '..', 'command-approves.js');
+const hookModule = require('../command-approves.js');
+
+function withRules(rules, callback) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'command-approves-evaluate-'));
+  const rulesPath = path.join(root, 'rules.json');
+  const previousRulesPath = process.env.COMMAND_APPROVES_RULES;
+  fs.writeFileSync(rulesPath, JSON.stringify({ rules }), 'utf8');
+  process.env.COMMAND_APPROVES_RULES = rulesPath;
+  try {
+    return callback();
+  } finally {
+    if (previousRulesPath === undefined) {
+      delete process.env.COMMAND_APPROVES_RULES;
+    } else {
+      process.env.COMMAND_APPROVES_RULES = previousRulesPath;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
 
 function run(event, rules) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'command-approves-test-'));
@@ -65,13 +84,134 @@ test('PermissionRequest denies a matching deny rule', () => {
   assert.match(output.hookSpecificOutput.decision.message, /git push/);
 });
 
-test('an ask rule defers to the normal approval flow in both events', () => {
-  for (const eventName of ['PreToolUse', 'PermissionRequest']) {
-    const { output } = run(bash('p4 submit', eventName), [
-      { pattern: 'p4', action: 'ask' },
-    ]);
-    assert.equal(output, undefined, eventName);
-  }
+test('an approved ask rule allows the command in PreToolUse', () => {
+  let prompt;
+  const output = withRules(
+    [{ pattern: 'p4', action: 'ask' }],
+    () => hookModule.evaluateEvent(
+      bash('p4 submit'),
+      {
+        confirmAsk(value) {
+          prompt = value;
+          return true;
+        },
+      },
+    ),
+  );
+
+  assert.deepEqual(prompt, {
+    command: 'p4 submit',
+    cwd: 'C:\\workspace',
+    pattern: 'p4',
+  });
+  assert.equal(output.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.equal(output.hookSpecificOutput.permissionDecision, 'allow');
+});
+
+test('the dialog renders the prompt payload sent by evaluateEvent', () => {
+  const message = hookModule.renderAskDialogMessage({
+    command: 'p4 submit',
+    cwd: 'C:\\workspace',
+    pattern: 'p4',
+  });
+
+  assert.equal(
+    message,
+    [
+      'Allow this command?',
+      '',
+      'Command: p4 submit',
+      'Matched rule: p4',
+      'Working directory: C:\\workspace',
+      '',
+      'Choose Yes to run this command. Choose No to deny it.',
+    ].join('\r\n'),
+  );
+});
+
+test('the ask dialog renders Chinese copy when Chinese is selected', () => {
+  const message = hookModule.renderAskDialogMessage(
+    {
+      command: 'p4 submit',
+      cwd: 'C:\\workspace',
+      pattern: 'p4',
+    },
+    'zh',
+  );
+
+  assert.equal(
+    message,
+    [
+      '允许执行此命令吗？',
+      '',
+      '命令：p4 submit',
+      '匹配规则：p4',
+      '工作目录：C:\\workspace',
+      '',
+      '选择“是”执行命令，选择“否”拒绝执行。',
+    ].join('\r\n'),
+  );
+  assert.equal(hookModule.askDialogTitle('zh'), 'Codex 命令审批');
+});
+
+test('COMMAND_APPROVES_LOCALE takes precedence over the system locale', () => {
+  assert.equal(
+    hookModule.detectAskLocale({ COMMAND_APPROVES_LOCALE: 'zh-CN' }, 'en-US'),
+    'zh',
+  );
+  assert.equal(
+    hookModule.detectAskLocale({ COMMAND_APPROVES_LOCALE: 'en-US' }, 'zh-CN'),
+    'en',
+  );
+});
+
+test('the system locale selects Chinese when no override is configured', () => {
+  assert.equal(hookModule.detectAskLocale({}, 'zh-CN'), 'zh');
+  assert.equal(hookModule.detectAskLocale({}, 'en-US'), 'en');
+});
+
+test('a rejected ask rule denies the command in PreToolUse', () => {
+  const output = withRules(
+    [{ pattern: 'p4', action: 'ask' }],
+    () => hookModule.evaluateEvent(
+      bash('p4 submit'),
+      { confirmAsk: () => false },
+    ),
+  );
+
+  assert.equal(output.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /not approved/);
+});
+
+test('an ask dialog failure denies the command', () => {
+  const output = withRules(
+    [{ pattern: 'p4', action: 'ask' }],
+    () => hookModule.evaluateEvent(
+      bash('p4 submit'),
+      {
+        confirmAsk() {
+          throw new Error('dialog unavailable');
+        },
+      },
+    ),
+  );
+
+  assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /dialog unavailable/);
+});
+
+test('an approved ask rule allows the request in PermissionRequest', () => {
+  const output = withRules(
+    [{ pattern: 'p4', action: 'ask' }],
+    () => hookModule.evaluateEvent(
+      bash('p4 submit', 'PermissionRequest'),
+      { confirmAsk: () => true },
+    ),
+  );
+
+  assert.equal(output.hookSpecificOutput.hookEventName, 'PermissionRequest');
+  assert.deepEqual(output.hookSpecificOutput.decision, { behavior: 'allow' });
 });
 
 test('an allow rule passes PreToolUse without overriding later safety layers', () => {

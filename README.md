@@ -45,12 +45,34 @@ The hook is registered for both `PreToolUse` and `PermissionRequest` with a
 - `deny` is returned as an explicit Codex denial and the command does not run.
 - `allow` delegates in `PreToolUse`; if Codex asks for permission, the hook
   approves that request.
-- `ask` declines to decide in `PreToolUse` and `PermissionRequest`, preserving
-  Codex's native approval prompt.
+- `ask` opens a Windows confirmation dialog showing the command, matched rule,
+  and working directory. Choosing Yes allows the command; choosing No, closing
+  the dialog, or timing out denies it.
 
-Codex does not support `permissionDecision: "ask"` in `PreToolUse` today. As a
-result, an `ask` rule can retain the native prompt but cannot force a prompt for
-a command that the active sandbox and approval policy allow without asking.
+Codex does not support `permissionDecision: "ask"` in `PreToolUse` today, so the
+confirmation dialog is displayed by the hook process itself. It works even when
+the active approval policy is `never`. On non-Windows platforms, `ask` fails
+closed because no native dialog is available.
+
+Dialog copy is localized to Chinese or English. `COMMAND_APPROVES_LOCALE` takes
+priority when set; otherwise the hook uses `LC_ALL`, `LC_MESSAGES`, `LANG`, or
+the system locale. Locales beginning with `zh` use Chinese and all other
+locales use English.
+
+The installed hook should allow enough time for the dialog. The default internal
+timeout is 8 seconds for backwards safety. For normal use, set a longer internal
+timeout and keep the Codex hook timeout above it:
+
+```json
+{
+  "type": "command",
+  "command": "node \"C:\\Users\\Administrator\\.codex\\command-approves\\command-approves.js\" --dialog-timeout-ms=110000",
+  "timeout": 120
+}
+```
+
+The dialog timeout must remain below the Codex hook timeout. If Codex kills the
+hook process first, the hook cannot return its fail-closed denial.
 
 ## Test
 

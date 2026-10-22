@@ -1,12 +1,33 @@
 #!/usr/bin/env node
 'use strict';
 
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
 const RULES_PATH = process.env.COMMAND_APPROVES_RULES || path.join(__dirname, 'rules.json');
 const MAX_INPUT_LENGTH = 1024 * 1024;
 const MAX_DEPTH = 8;
+const DEFAULT_ASK_DIALOG_TIMEOUT_MS = 8000;
+const DIALOG_TIMEOUT_ARG = '--dialog-timeout-ms=';
+const ASK_DIALOG_COPY = {
+  en: {
+    title: 'Codex command approval',
+    prompt: 'Allow this command?',
+    command: 'Command: ',
+    rule: 'Matched rule: ',
+    cwd: 'Working directory: ',
+    decision: 'Choose Yes to run this command. Choose No to deny it.',
+  },
+  zh: {
+    title: 'Codex 命令审批',
+    prompt: '允许执行此命令吗？',
+    command: '命令：',
+    rule: '匹配规则：',
+    cwd: '工作目录：',
+    decision: '选择“是”执行命令，选择“否”拒绝执行。',
+  },
+};
 const POSIX = 'posix';
 const POWERSHELL = 'powershell';
 const ACTION_RANK = { allow: 0, ask: 1, deny: 2 };
@@ -530,7 +551,7 @@ function normalizeRules(source) {
   return { invalid, rules };
 }
 
-function loadRules(rulesPath = RULES_PATH) {
+function loadRules(rulesPath = process.env.COMMAND_APPROVES_RULES || RULES_PATH) {
   const text = fs.readFileSync(rulesPath, 'utf8');
   const document = JSON.parse(text);
   const source = Array.isArray(document) ? document : document && document.rules;
@@ -592,6 +613,16 @@ function preToolDeny(reason) {
   };
 }
 
+function preToolAllow(reason) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      permissionDecisionReason: reason,
+    },
+  };
+}
+
 function permissionDecision(behavior, message) {
   const decision = { behavior };
   if (message !== undefined) decision.message = message;
@@ -603,13 +634,124 @@ function permissionDecision(behavior, message) {
   };
 }
 
+function detectAskLocale(environment = process.env, systemLocale) {
+  const explicit = environment.COMMAND_APPROVES_LOCALE;
+  const configured = explicit || environment.LC_ALL || environment.LC_MESSAGES
+    || environment.LANG || systemLocale
+    || Intl.DateTimeFormat().resolvedOptions().locale;
+  return String(configured).toLowerCase().replace('_', '-').startsWith('zh') ? 'zh' : 'en';
+}
+
+function askDialogTitle(locale = 'en') {
+  return ASK_DIALOG_COPY[locale === 'zh' ? 'zh' : 'en'].title;
+}
+
+function buildAskDialogMessage({ command, cwd, pattern }, locale = 'en') {
+  const copy = ASK_DIALOG_COPY[locale === 'zh' ? 'zh' : 'en'];
+  const lines = [
+    copy.prompt,
+    '',
+    `${copy.command}${command}`,
+    `${copy.rule}${pattern}`,
+  ];
+  if (cwd) lines.push(`${copy.cwd}${cwd}`);
+  lines.push('', copy.decision);
+  return lines.join('\r\n');
+}
+
+function renderAskDialogMessage(prompt, locale = 'en') {
+  return typeof prompt === 'string' ? prompt : buildAskDialogMessage(prompt, locale);
+}
+
+function showAskDialog(prompt, timeoutMs = DEFAULT_ASK_DIALOG_TIMEOUT_MS) {
+  if (process.platform !== 'win32') {
+    throw new Error('Windows approval dialogs are not available on this platform');
+  }
+
+  const locale = detectAskLocale();
+  const message = renderAskDialogMessage(prompt, locale);
+  const title = askDialogTitle(locale);
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    '[System.Windows.Forms.Application]::EnableVisualStyles()',
+    `$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(title).toString('base64')}'))`,
+    `$message = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(message).toString('base64')}'))`,
+    '$answer = [System.Windows.Forms.MessageBox]::Show(',
+    '  $message,',
+    '  $title,',
+    '  [System.Windows.Forms.MessageBoxButtons]::YesNo,',
+    '  [System.Windows.Forms.MessageBoxIcon]::Question,',
+    '  [System.Windows.Forms.MessageBoxDefaultButton]::Button2',
+    ')',
+    'if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { exit 0 }',
+    'exit 1',
+  ].join('\n');
+  const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-STA', '-EncodedCommand', encodedScript],
+    {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      windowsHide: true,
+    },
+  );
+
+  if (result.error) throw result.error;
+  if (result.status === 0) return true;
+  if (result.status === 1) return false;
+  const detail = result.stderr.trim();
+  throw new Error(detail || 'approval dialog was closed without a decision');
+}
+
+function askDenialReason(command, rule, error) {
+  const suffix = `Matched rule "${rule.pattern}". The command was: ${command}`;
+  if (error === undefined) {
+    return `Command denied because it was not approved in the command-approves dialog. ${suffix}`;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return `Command denied because command-approves could not show the approval dialog: ${message}. ${suffix}`;
+}
+
+function evaluateAsk(eventName, event, command, outcome, options) {
+  const prompt = {
+    command,
+    cwd: typeof event.cwd === 'string' ? event.cwd : '',
+    pattern: outcome.rule.pattern,
+  };
+  let approved;
+  try {
+    const confirmAsk = options.confirmAsk || showAskDialog;
+    approved = confirmAsk(
+      prompt,
+      options.dialogTimeoutMs || DEFAULT_ASK_DIALOG_TIMEOUT_MS,
+    );
+  } catch (error) {
+    const reason = askDenialReason(command, outcome.rule, error);
+    return eventName === 'PermissionRequest'
+      ? permissionDecision('deny', reason)
+      : preToolDeny(reason);
+  }
+
+  if (approved === true) {
+    return eventName === 'PermissionRequest'
+      ? permissionDecision('allow')
+      : preToolAllow('Approved in the command-approves dialog.');
+  }
+
+  const reason = askDenialReason(command, outcome.rule);
+  return eventName === 'PermissionRequest'
+    ? permissionDecision('deny', reason)
+    : preToolDeny(reason);
+}
+
 function failClosed(eventName, command, error) {
   const reason = policyFailureReason(command, error);
   if (eventName === 'PermissionRequest') return permissionDecision('deny', reason);
   return preToolDeny(reason);
 }
 
-function evaluateEvent(event) {
+function evaluateEvent(event, options = {}) {
   const eventName = eventNameOf(event);
   if (eventName === undefined) return undefined;
   if (String(event.tool_name || '').toLowerCase() !== 'bash') return undefined;
@@ -631,12 +773,23 @@ function evaluateEvent(event) {
       : preToolDeny(reason);
   }
 
-  // PreToolUse cannot request an approval today. An ask rule therefore has to
-  // decline this hook's decision and let Codex's normal approval flow decide.
+  if (outcome.action === 'ask') {
+    return evaluateAsk(eventName, event, command, outcome, options);
+  }
+
   if (eventName === 'PermissionRequest' && outcome.action === 'allow') {
     return permissionDecision('allow');
   }
   return undefined;
+}
+
+function dialogTimeoutMsFromArgv(argv) {
+  for (const argument of argv) {
+    if (!argument.startsWith(DIALOG_TIMEOUT_ARG)) continue;
+    const value = Number(argument.slice(DIALOG_TIMEOUT_ARG.length));
+    if (Number.isSafeInteger(value) && value > 0) return value;
+  }
+  return DEFAULT_ASK_DIALOG_TIMEOUT_MS;
 }
 
 function main() {
@@ -656,7 +809,9 @@ function main() {
     if (input.length > MAX_INPUT_LENGTH) return;
     try {
       const event = JSON.parse(input);
-      const output = evaluateEvent(event);
+      const output = evaluateEvent(event, {
+        dialogTimeoutMs: dialogTimeoutMsFromArgv(process.argv.slice(2)),
+      });
       if (output !== undefined) process.stdout.write(JSON.stringify(output));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -670,13 +825,19 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  DEFAULT_ASK_DIALOG_TIMEOUT_MS,
   RULES_PATH,
   analyzeCommand,
+  askDialogTitle,
+  buildAskDialogMessage,
+  detectAskLocale,
+  dialogTimeoutMsFromArgv,
   evaluateCommand,
   evaluateEvent,
   loadRules,
   matchesRule,
   normalizeExpression,
   normalizeRules,
+  renderAskDialogMessage,
   tokenizeScript,
 };
